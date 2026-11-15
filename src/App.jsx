@@ -22,8 +22,8 @@ const Logo = ({ size = "w-10 h-10" }) => (
 
 export default function App() {
   // Autentikasi State (Tahap 3)
-  const [isLoggedIn, setIsLoggedIn] = useState(true);
-  const [currentUser, setCurrentUser] = useState({ name: "Budi Santoso", role: "Pemilik Warung" });
+  const [isLoggedIn, setIsLoggedIn] = useState(false);
+  const [currentUser, setCurrentUser] = useState({ name: "", role: "Pemilik Warung" });
   const [isRegisterMode, setIsRegisterMode] = useState(false);
   const [loginEmail, setLoginEmail] = useState('');
   const [loginPassword, setLoginPassword] = useState('');
@@ -104,21 +104,29 @@ export default function App() {
     // Cek sesi aktif Supabase Auth saat aplikasi dibuka
     supabase.auth.getSession().then(({ data: { session } }) => {
       if (session) {
+        const role = session.user.user_metadata?.role || "Pemilik Warung";
         setIsLoggedIn(true);
         setCurrentUser({
           name: session.user.email,
-          role: session.user.user_metadata?.role || "Pemilik Warung"
+          role: role
         });
+        if (role === 'Kasir') {
+          setActiveTab('pos');
+        }
       }
     });
 
     const { data: authListener } = supabase.auth.onAuthStateChange((_event, session) => {
       if (session) {
+        const role = session.user.user_metadata?.role || "Pemilik Warung";
         setIsLoggedIn(true);
         setCurrentUser({
           name: session.user.email,
-          role: session.user.user_metadata?.role || "Pemilik Warung"
+          role: role
         });
+        if (role === 'Kasir') {
+          setActiveTab('pos');
+        }
       }
     });
 
@@ -133,9 +141,32 @@ export default function App() {
       })
       .subscribe();
 
+    // Sinkronisasi otomatis transaksi offline saat online kembali
+    const syncPendingTransactions = async () => {
+      try {
+        const pending = JSON.parse(localStorage.getItem('pending_transactions') || '[]');
+        if (pending.length === 0) return;
+        console.log(`Mengirim ${pending.length} transaksi offline ke Supabase...`);
+        const { error } = await supabase.from('transactions').insert(pending);
+        if (!error) {
+          localStorage.removeItem('pending_transactions');
+          console.log("Semua transaksi offline berhasil disinkronkan ke Supabase!");
+          fetchDataFromSupabase();
+        }
+      } catch (e) {
+        console.error("Gagal sinkronisasi otomatis:", e);
+      }
+    };
+
+    if (navigator.onLine) {
+      syncPendingTransactions();
+    }
+    window.addEventListener('online', syncPendingTransactions);
+
     return () => {
       authListener?.subscription?.unsubscribe();
       supabase.removeChannel(channel);
+      window.removeEventListener('online', syncPendingTransactions);
     };
   }, []);
 
@@ -230,11 +261,17 @@ export default function App() {
         setAuthError(msg);
         alert("Login gagal: " + msg);
       } else {
+        const role = userRole || data.user.user_metadata?.role || "Pemilik Warung";
         setIsLoggedIn(true);
         setCurrentUser({
           name: data.user.email,
-          role: data.user.user_metadata?.role || "Pemilik Warung"
+          role: role
         });
+        if (role === 'Kasir') {
+          setActiveTab('pos');
+        } else {
+          setActiveTab('dashboard');
+        }
       }
     }
   };
@@ -246,6 +283,8 @@ export default function App() {
       console.error(err);
     }
     setIsLoggedIn(false);
+    setCurrentUser({ name: '', role: 'Pemilik Warung' });
+    setActiveTab('pos');
   };
 
   // Keranjang Kasir
@@ -518,7 +557,7 @@ export default function App() {
     setCart(cart.filter(item => item.id !== id));
   };
 
-  // Proses Checkout & Integrasi Supabase
+  // Proses Checkout & Integrasi Supabase (Offline-First Mode)
   const handleCheckout = async () => {
     if (cart.length === 0) {
       alert("Keranjang masih kosong!");
@@ -537,63 +576,113 @@ export default function App() {
     const now = new Date().toISOString().slice(0, 16).replace('T', ' ');
     const totalProfit = cart.reduce((sum, item) => sum + ((item.sellPrice - item.buyPrice) * item.qty), 0);
 
-    // 1. Simpan Transaksi ke Supabase
+    // 1. Buat data transaksi baru
     const newTrx = {
       id: trxId,
       date: now,
-      items: cart,
+      items: [...cart],
       total: finalTotal,
       profit: totalProfit,
       method: paymentMethod,
       customer: selectedCustomer || "Umum"
     };
 
-    const { error: trxError } = await supabase.from('transactions').insert([newTrx]);
-    if (trxError) {
-      alert("Gagal menyimpan transaksi ke database!");
-      console.error(trxError);
-      return;
+    // 2. SELALU SIMPAN KE LOCALSTORAGE (Aman 100% meskipun offline / tanpa koneksi)
+    try {
+      const dataLama = JSON.parse(localStorage.getItem('riwayat_transaksi') || '[]');
+      dataLama.unshift(newTrx);
+      localStorage.setItem('riwayat_transaksi', JSON.stringify(dataLama));
+    } catch (e) {
+      console.warn("Gagal simpan ke localStorage:", e);
     }
 
-    // 2. Update Stok Produk di Supabase
-    for (const cartItem of cart) {
-      const targetProd = products.find(p => p.id === cartItem.id);
-      if (targetProd) {
-        const newStock = targetProd.stock - cartItem.qty;
-        await supabase
-          .from('products')
-          .update({ stock: newStock })
-          .eq('id', cartItem.id);
+    // 3. Update Stok di State Lokal (Kasir tidak terganggu jika offline)
+    const updatedProducts = products.map(p => {
+      const cartItem = cart.find(c => c.id === p.id);
+      if (cartItem) {
+        return { ...p, stock: Math.max(0, p.stock - cartItem.qty) };
       }
-    }
+      return p;
+    });
+    setProducts(updatedProducts);
 
-    // 3. Jika Utang Pelanggan
+    // 4. Update Utang di State Lokal (Jika Utang Pelanggan)
     if (paymentMethod === 'Utang Pelanggan') {
-      const targetDebt = debts.find(d => d.name === selectedCustomer);
-      if (targetDebt) {
-        const updatedAmount = targetDebt.amount + finalTotal;
-        const updatedHistory = [...(targetDebt.history || []), { date: now, note: `Belanja POS (${trxId})`, amount: finalTotal }];
-
-        await supabase
-          .from('debts')
-          .update({ amount: updatedAmount, history: updatedHistory })
-          .eq('id', targetDebt.id);
-      }
+      setDebts(debts.map(d => {
+        if (d.name === selectedCustomer) {
+          return {
+            ...d,
+            amount: d.amount + finalTotal,
+            history: [...(d.history || []), { date: now, note: `Belanja POS (${trxId})`, amount: finalTotal }]
+          };
+        }
+        return d;
+      }));
     }
 
-    // Perbarui state lokal & tampilkan struk
+    // 5. COBA KIRIM KE SUPABASE JIKA ADA INTERNET
+    if (navigator.onLine) {
+      try {
+        const { error: trxError } = await supabase.from('transactions').insert([newTrx]);
+        if (trxError) throw trxError;
+
+        // Update stok produk di Supabase
+        for (const cartItem of cart) {
+          const targetProd = products.find(p => p.id === cartItem.id);
+          if (targetProd) {
+            const newStock = Math.max(0, targetProd.stock - cartItem.qty);
+            await supabase
+              .from('products')
+              .update({ stock: newStock })
+              .eq('id', cartItem.id);
+          }
+        }
+
+        // Update utang di Supabase (Jika Utang Pelanggan)
+        if (paymentMethod === 'Utang Pelanggan') {
+          const targetDebt = debts.find(d => d.name === selectedCustomer);
+          if (targetDebt) {
+            const updatedAmount = targetDebt.amount + finalTotal;
+            const updatedHistory = [...(targetDebt.history || []), { date: now, note: `Belanja POS (${trxId})`, amount: finalTotal }];
+
+            await supabase
+              .from('debts')
+              .update({ amount: updatedAmount, history: updatedHistory })
+              .eq('id', targetDebt.id);
+          }
+        }
+
+        console.log("Transaksi berhasil dikirim ke cloud Supabase!");
+      } catch (err) {
+        console.warn("Gagal sinkron ke Supabase, data tersimpan aman di lokal:", err.message);
+        // Simpan ke antrean sinkronisasi offline
+        const pendingSync = JSON.parse(localStorage.getItem('pending_transactions') || '[]');
+        pendingSync.push(newTrx);
+        localStorage.setItem('pending_transactions', JSON.stringify(pendingSync));
+      }
+    } else {
+      console.log("Mode Offline: Transaksi tersimpan aman di memori perangkat.");
+      // Simpan ke antrean sinkronisasi offline
+      const pendingSync = JSON.parse(localStorage.getItem('pending_transactions') || '[]');
+      pendingSync.push(newTrx);
+      localStorage.setItem('pending_transactions', JSON.stringify(pendingSync));
+    }
+
+    // 6. Perbarui state transaksi lokal & Tampilkan Struk Pembelian
     setTransactions([newTrx, ...transactions]);
     setLastReceipt(newTrx);
     setShowReceiptModal(true);
 
-    // Reset Kasir
+    // 7. Reset Kasir
     setCart([]);
     setCashAmount('');
     setDiscountAmount(0);
     setSelectedCustomer('');
 
-    // Refresh data terbaru dari Supabase
-    fetchDataFromSupabase();
+    // Jika online, refresh data terbaru dari Supabase
+    if (navigator.onLine) {
+      fetchDataFromSupabase();
+    }
   };
 
   // Tambah / Perbarui Produk
@@ -763,19 +852,19 @@ export default function App() {
               />
             </div>
 
-            {isRegisterMode && (
-              <div>
-                <label className="block text-xs font-semibold text-gray-600 mb-1">Peran / Hak Akses</label>
-                <select
-                  value={userRole}
-                  onChange={(e) => setUserRole(e.target.value)}
-                  className="w-full px-4 py-2.5 border border-gray-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-emerald-500"
-                >
-                  <option value="Pemilik Warung">Pemilik Warung (Akses Penuh)</option>
-                  <option value="Kasir">Kasir (Transaksi & POS)</option>
-                </select>
-              </div>
-            )}
+            <div>
+              <label className="block text-xs font-semibold text-gray-600 mb-1">
+                {isRegisterMode ? 'Pilih Peran Akun' : 'Masuk Sebagai (Peran)'}
+              </label>
+              <select
+                value={userRole}
+                onChange={(e) => setUserRole(e.target.value)}
+                className="w-full px-4 py-2.5 border border-gray-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-emerald-500 bg-white"
+              >
+                <option value="Pemilik Warung">👑 Pemilik Warung (Semua Akses & Laporan)</option>
+                <option value="Kasir">🛒 Kasir (Hanya Transaksi & Cek Stok)</option>
+              </select>
+            </div>
 
             {authError && (
               <div className="p-3 bg-red-50 border border-red-200 text-red-600 rounded-xl text-xs flex items-center space-x-2">
@@ -811,19 +900,6 @@ export default function App() {
               )}
             </button>
           </form>
-
-          <div className="mt-6 pt-6 border-t border-gray-100 text-center">
-            <button
-              type="button"
-              onClick={() => {
-                setIsLoggedIn(true);
-                setCurrentUser({ name: "Budi Santoso", role: "Pemilik Warung (Mode Tamu)" });
-              }}
-              className="text-xs text-gray-400 hover:text-emerald-600 transition underline"
-            >
-              Lanjutkan sebagai Mode Demo (Tanpa Login)
-            </button>
-          </div>
         </div>
       </div>
     );
@@ -844,42 +920,65 @@ export default function App() {
 
         <nav className="flex-1 px-4 py-4 space-y-1.5 overflow-y-auto">
           {[
-            { id: 'dashboard', label: 'Dashboard', icon: LayoutDashboard },
-            { id: 'pos', label: 'Kasir / Penjualan', icon: ShoppingCart },
-            { id: 'inventory', label: 'Stok Barang', icon: Package },
-            { id: 'debts', label: 'Buku Utang', icon: BookOpen },
-            { id: 'purchases', label: 'Pembelian Masuk', icon: Truck },
-            { id: 'barcodes', label: 'Cetak Barcode', icon: Tag },
-            { id: 'reports', label: 'Laporan Keuangan', icon: BarChart3 },
-            { id: 'settings', label: 'Pengaturan', icon: Settings },
-          ].map(item => {
-            const Icon = item.icon;
-            const active = activeTab === item.id;
-            return (
-              <button
-                key={item.id}
-                onClick={() => { setActiveTab(item.id); setMobileMenuOpen(false); }}
-                className={`w-full flex items-center space-x-3 px-4 py-3 rounded-xl font-medium transition-all ${active ? 'bg-emerald-600 text-white shadow-lg shadow-emerald-600/30' : 'text-emerald-100 hover:bg-emerald-800/60'}`}
-              >
-                <Icon className="w-5 h-5" />
-                <span>{item.label}</span>
-              </button>
-            );
-          })}
+            { id: 'dashboard', label: 'Dashboard', icon: LayoutDashboard, roles: ['Pemilik Warung'] },
+            { id: 'pos', label: 'Kasir / Penjualan', icon: ShoppingCart, roles: ['Pemilik Warung', 'Kasir'] },
+            { id: 'inventory', label: 'Stok Barang', icon: Package, roles: ['Pemilik Warung', 'Kasir'] },
+            { id: 'debts', label: 'Buku Utang', icon: BookOpen, roles: ['Pemilik Warung', 'Kasir'] },
+            { id: 'purchases', label: 'Pembelian Masuk', icon: Truck, roles: ['Pemilik Warung'] },
+            { id: 'barcodes', label: 'Cetak Barcode', icon: Tag, roles: ['Pemilik Warung', 'Kasir'] },
+            { id: 'reports', label: 'Laporan Keuangan', icon: BarChart3, roles: ['Pemilik Warung'] },
+            { id: 'settings', label: 'Pengaturan', icon: Settings, roles: ['Pemilik Warung'] },
+          ]
+            .filter(item => item.roles.includes(currentUser?.role || 'Pemilik Warung'))
+            .map(item => {
+              const Icon = item.icon;
+              const active = activeTab === item.id;
+              return (
+                <button
+                  key={item.id}
+                  onClick={() => { setActiveTab(item.id); setMobileMenuOpen(false); }}
+                  className={`w-full flex items-center space-x-3 px-4 py-3 rounded-xl font-medium transition-all ${active ? 'bg-emerald-600 text-white shadow-lg shadow-emerald-600/30' : 'text-emerald-100 hover:bg-emerald-800/60'}`}
+                >
+                  <Icon className="w-5 h-5" />
+                  <span>{item.label}</span>
+                </button>
+              );
+            })}
         </nav>
 
-        <div className="p-4 border-t border-emerald-800 bg-emerald-950/50 flex items-center justify-between">
-          <div className="flex items-center space-x-3">
-            <div className="w-9 h-9 rounded-full bg-emerald-700 flex items-center justify-center font-bold text-white">
-              {currentUser.name ? currentUser.name.charAt(0).toUpperCase() : 'U'}
+        <div className="p-4 border-t border-emerald-800 bg-emerald-950/50 space-y-2.5">
+          <div className="flex items-center justify-between">
+            <div className="flex items-center space-x-3">
+              <div className={`w-9 h-9 rounded-full flex items-center justify-center font-bold text-white shadow ${currentUser?.role === 'Kasir' ? 'bg-blue-600' : 'bg-emerald-700'}`}>
+                {currentUser.name ? currentUser.name.charAt(0).toUpperCase() : 'U'}
+              </div>
+              <div>
+                <p className="text-sm font-semibold truncate max-w-[120px]">{currentUser.name}</p>
+                <span className={`text-[10px] font-bold px-2 py-0.5 rounded-full inline-block mt-0.5 ${currentUser?.role === 'Kasir' ? 'bg-blue-500/30 text-blue-200 border border-blue-400/40' : 'bg-emerald-500/30 text-emerald-200 border border-emerald-400/40'}`}>
+                  {currentUser?.role === 'Kasir' ? '🛒 Kasir' : '👑 Pemilik'}
+                </span>
+              </div>
             </div>
-            <div>
-              <p className="text-sm font-semibold truncate max-w-[130px]">{currentUser.name}</p>
-              <p className="text-xs text-emerald-300">{currentUser.role}</p>
-            </div>
+            <button onClick={handleLogout} title="Keluar / Logout" className="text-emerald-300 hover:text-white p-1">
+              <LogOut className="w-5 h-5" />
+            </button>
           </div>
-          <button onClick={handleLogout} title="Keluar / Logout" className="text-emerald-300 hover:text-white p-1">
-            <LogOut className="w-5 h-5" />
+
+          {/* Tombol Praktis Beralih Peran Akun */}
+          <button
+            type="button"
+            onClick={() => {
+              const nextRole = currentUser?.role === 'Kasir' ? 'Pemilik Warung' : 'Kasir';
+              setCurrentUser(prev => ({ ...prev, role: nextRole }));
+              if (nextRole === 'Kasir') {
+                setActiveTab('pos');
+              }
+            }}
+            className="w-full text-[11px] font-bold py-1.5 px-2 rounded-lg bg-emerald-800/80 hover:bg-emerald-700 text-white border border-emerald-600/50 transition flex items-center justify-center space-x-1.5 shadow-sm"
+            title="Klik untuk beralih mode akun seketika"
+          >
+            <RefreshCw className="w-3 h-3 text-emerald-300" />
+            <span>Ganti Peran ke {currentUser?.role === 'Kasir' ? '👑 Pemilik' : '🛒 Kasir'}</span>
           </button>
         </div>
       </aside>
@@ -899,13 +998,31 @@ export default function App() {
             </div>
           </div>
 
-          <div className="flex items-center space-x-4">
-            <div className="hidden sm:flex items-center space-x-2 bg-emerald-50 px-3 py-1.5 rounded-full border border-emerald-200">
-              <span className="w-2.5 h-2.5 rounded-full bg-emerald-500 animate-pulse"></span>
-              <span className="text-xs font-semibold text-emerald-800">Sistem Online & Terhubung</span>
+          <div className="flex items-center space-x-3">
+            {/* Indikator Status Akun */}
+            <div className={`flex items-center space-x-1.5 px-3 py-1.5 rounded-xl text-xs font-bold border ${currentUser?.role === 'Kasir' ? 'bg-blue-50 text-blue-700 border-blue-200' : 'bg-emerald-50 text-emerald-700 border-emerald-200'}`}>
+              <span>{currentUser?.role === 'Kasir' ? '🛒 Peran: Kasir' : '👑 Peran: Pemilik Warung'}</span>
             </div>
+
+            {/* Tombol Beralih Mode Cepat */}
+            <button
+              type="button"
+              onClick={() => {
+                const nextRole = currentUser?.role === 'Kasir' ? 'Pemilik Warung' : 'Kasir';
+                setCurrentUser(prev => ({ ...prev, role: nextRole }));
+                if (nextRole === 'Kasir') {
+                  setActiveTab('pos');
+                }
+              }}
+              className="hidden sm:flex text-xs font-bold px-3 py-1.5 rounded-xl border border-gray-200 hover:bg-gray-100 text-gray-700 transition items-center space-x-1.5 shadow-sm"
+              title="Ganti peran akun untuk melihat perbedaan fitur"
+            >
+              <RefreshCw className="w-3.5 h-3.5 text-emerald-600" />
+              <span>Ganti ke {currentUser?.role === 'Kasir' ? 'Pemilik' : 'Kasir'}</span>
+            </button>
+
             <div className="w-8 h-8 rounded-full bg-emerald-100 text-emerald-800 flex items-center justify-center font-bold text-sm">
-              {currentUser.name.charAt(0)}
+              {currentUser.name ? currentUser.name.charAt(0).toUpperCase() : 'U'}
             </div>
           </div>
         </header>
@@ -913,8 +1030,31 @@ export default function App() {
         {/* CONTENT DYNAMIC */}
         <main className="flex-1 p-6 bg-gray-50 overflow-y-auto">
 
+          {/* Proteksi Halaman Khusus Pemilik dari Akses Kasir */}
+          {currentUser?.role === 'Kasir' && ['dashboard', 'purchases', 'reports', 'settings'].includes(activeTab) && (
+            <div className="bg-white rounded-3xl p-8 border border-amber-200 text-center max-w-md mx-auto my-12 shadow-md space-y-4">
+              <div className="w-16 h-16 bg-amber-100 text-amber-600 rounded-full flex items-center justify-center mx-auto shadow-inner">
+                <Shield className="w-8 h-8" />
+              </div>
+              <h3 className="text-lg font-bold text-gray-800">Akses Terbatas (Khusus Pemilik)</h3>
+              <p className="text-xs text-gray-600 leading-relaxed">
+                Halaman <strong>{activeTab.toUpperCase()}</strong> berisi data privasi keuangan (omzet toko, laba bersih, supplier, atau konfigurasi).
+                Akun dengan peran <strong>Kasir</strong> difokuskan hanya untuk transaksi penjualan & kasbon.
+              </p>
+              <div className="pt-2">
+                <button
+                  onClick={() => setActiveTab('pos')}
+                  className="bg-emerald-600 hover:bg-emerald-700 text-white font-bold px-5 py-2.5 rounded-xl text-xs transition shadow-md inline-flex items-center space-x-2"
+                >
+                  <ShoppingCart className="w-4 h-4" />
+                  <span>Buka Kasir / Penjualan</span>
+                </button>
+              </div>
+            </div>
+          )}
+
           {/* TAB 1: DASHBOARD */}
-          {activeTab === 'dashboard' && (
+          {activeTab === 'dashboard' && currentUser?.role === 'Pemilik Warung' && (
             <div className="space-y-6">
               <div className="bg-gradient-to-r from-emerald-600 to-emerald-800 text-white rounded-2xl p-6 shadow-lg flex flex-col md:flex-row items-center justify-between">
                 <div>
@@ -1234,88 +1374,110 @@ export default function App() {
               <div className="flex flex-col sm:flex-row items-center justify-between gap-4">
                 <div>
                   <h3 className="text-lg font-bold text-gray-800">Manajemen Stok & Produk</h3>
-                  <p className="text-xs text-gray-500">Kelola inventaris, harga kulak, dan harga jual produk warung.</p>
+                  <p className="text-xs text-gray-500">
+                    {currentUser?.role === 'Kasir'
+                      ? 'Daftar katalog ketersediaan stok produk dan harga jual untuk kasir.'
+                      : 'Kelola inventaris, harga kulak, dan harga jual produk warung.'}
+                  </p>
                 </div>
-                <button
-                  onClick={() => setEditingProduct(null)}
-                  className="bg-emerald-600 hover:bg-emerald-700 text-white font-bold px-4 py-2.5 rounded-xl text-sm shadow-md transition flex items-center space-x-2"
-                >
-                  <Plus className="w-4 h-4" />
-                  <span>Tambah Produk Baru</span>
-                </button>
+                {currentUser?.role === 'Pemilik Warung' && (
+                  <button
+                    onClick={() => setEditingProduct(null)}
+                    className="bg-emerald-600 hover:bg-emerald-700 text-white font-bold px-4 py-2.5 rounded-xl text-sm shadow-md transition flex items-center space-x-2"
+                  >
+                    <Plus className="w-4 h-4" />
+                    <span>Tambah Produk Baru</span>
+                  </button>
+                )}
               </div>
 
-              <form onSubmit={handleAddProduct} className="bg-gray-50 p-4 rounded-2xl border border-gray-200 grid grid-cols-1 sm:grid-cols-4 gap-4">
-                <input
-                  type="text"
-                  placeholder="Kode Produk (mis. BRD007)"
-                  value={newProduct.code}
-                  onChange={(e) => setNewProduct({ ...newProduct, code: e.target.value })}
-                  className="border border-gray-200 rounded-xl px-3 py-2 text-xs bg-white"
-                />
-                <input
-                  type="text"
-                  placeholder="Nama Barang"
-                  value={newProduct.name}
-                  onChange={(e) => setNewProduct({ ...newProduct, name: e.target.value })}
-                  className="border border-gray-200 rounded-xl px-3 py-2 text-xs bg-white"
-                />
-                <select
-                  value={newProduct.category}
-                  onChange={(e) => setNewProduct({ ...newProduct, category: e.target.value })}
-                  className="border border-gray-200 rounded-xl px-3 py-2 text-xs bg-white"
-                >
-                  <option value="Sembako">Sembako</option>
-                  <option value="Makanan">Makanan</option>
-                  <option value="Minuman">Minuman</option>
-                  <option value="Kebutuhan Rumah">Kebutuhan Rumah</option>
-                </select>
-                <input
-                  type="number"
-                  placeholder="Harga Kulak (Beli)"
-                  value={newProduct.buyPrice}
-                  onChange={(e) => setNewProduct({ ...newProduct, buyPrice: e.target.value })}
-                  className="border border-gray-200 rounded-xl px-3 py-2 text-xs bg-white"
-                />
-                <input
-                  type="number"
-                  placeholder="Harga Jual"
-                  value={newProduct.sellPrice}
-                  onChange={(e) => setNewProduct({ ...newProduct, sellPrice: e.target.value })}
-                  className="border border-gray-200 rounded-xl px-3 py-2 text-xs bg-white"
-                />
-                <input
-                  type="number"
-                  placeholder="Jumlah Stok Awal"
-                  value={newProduct.stock}
-                  onChange={(e) => setNewProduct({ ...newProduct, stock: e.target.value })}
-                  className="border border-gray-200 rounded-xl px-3 py-2 text-xs bg-white"
-                />
-                <input
-                  type="text"
-                  placeholder="Satuan (Pcs/Kg/Sak)"
-                  value={newProduct.unit}
-                  onChange={(e) => setNewProduct({ ...newProduct, unit: e.target.value })}
-                  className="border border-gray-200 rounded-xl px-3 py-2 text-xs bg-white"
-                />
-                <div className="flex space-x-2">
-                  <button type="submit" className="flex-1 bg-emerald-600 hover:bg-emerald-700 text-white font-bold rounded-xl text-xs py-2 shadow">
-                    {editingProduct ? 'Perbarui Produk' : 'Simpan Produk'}
-                  </button>
-                  {editingProduct && (
-                    <button
-                      type="button"
-                      onClick={() => {
-                        setEditingProduct(null);
-                        setNewProduct({ code: '', name: '', category: 'Sembako', buyPrice: '', sellPrice: '', stock: '', unit: 'Pcs', supplier: '' });
-                      }}
-                      className="bg-gray-200 hover:bg-gray-300 text-gray-700 font-bold rounded-xl text-xs px-3 py-2"
-                    >
-                      Batal
-                    </button>
-                  )}
+              {/* Banner Khusus Mode Kasir */}
+              {currentUser?.role === 'Kasir' && (
+                <div className="bg-blue-50 border border-blue-200 rounded-xl p-3.5 flex items-start space-x-3 text-xs text-blue-900">
+                  <Shield className="w-5 h-5 flex-shrink-0 text-blue-600 mt-0.5" />
+                  <div>
+                    <span className="font-bold">Mode Akses Kasir Aktif:</span>
+                    <p className="text-blue-700 mt-0.5">
+                      Anda dapat melihat ketersediaan stok dan harga jual kepada pelanggan. Informasi harga modal (kulak), margin laba bersih, serta tombol tambah/edit produk disembunyikan demi privasi toko.
+                    </p>
+                  </div>
                 </div>
-              </form>
+              )}
+
+              {/* Form Tambah/Edit Produk (Hanya untuk Pemilik Warung) */}
+              {currentUser?.role === 'Pemilik Warung' && (
+                <form onSubmit={handleAddProduct} className="bg-gray-50 p-4 rounded-2xl border border-gray-200 grid grid-cols-1 sm:grid-cols-4 gap-4">
+                  <input
+                    type="text"
+                    placeholder="Kode Produk (mis. BRD007)"
+                    value={newProduct.code}
+                    onChange={(e) => setNewProduct({ ...newProduct, code: e.target.value })}
+                    className="border border-gray-200 rounded-xl px-3 py-2 text-xs bg-white"
+                  />
+                  <input
+                    type="text"
+                    placeholder="Nama Barang"
+                    value={newProduct.name}
+                    onChange={(e) => setNewProduct({ ...newProduct, name: e.target.value })}
+                    className="border border-gray-200 rounded-xl px-3 py-2 text-xs bg-white"
+                  />
+                  <select
+                    value={newProduct.category}
+                    onChange={(e) => setNewProduct({ ...newProduct, category: e.target.value })}
+                    className="border border-gray-200 rounded-xl px-3 py-2 text-xs bg-white"
+                  >
+                    <option value="Sembako">Sembako</option>
+                    <option value="Makanan">Makanan</option>
+                    <option value="Minuman">Minuman</option>
+                    <option value="Kebutuhan Rumah">Kebutuhan Rumah</option>
+                  </select>
+                  <input
+                    type="number"
+                    placeholder="Harga Kulak (Beli)"
+                    value={newProduct.buyPrice}
+                    onChange={(e) => setNewProduct({ ...newProduct, buyPrice: e.target.value })}
+                    className="border border-gray-200 rounded-xl px-3 py-2 text-xs bg-white"
+                  />
+                  <input
+                    type="number"
+                    placeholder="Harga Jual"
+                    value={newProduct.sellPrice}
+                    onChange={(e) => setNewProduct({ ...newProduct, sellPrice: e.target.value })}
+                    className="border border-gray-200 rounded-xl px-3 py-2 text-xs bg-white"
+                  />
+                  <input
+                    type="number"
+                    placeholder="Jumlah Stok Awal"
+                    value={newProduct.stock}
+                    onChange={(e) => setNewProduct({ ...newProduct, stock: e.target.value })}
+                    className="border border-gray-200 rounded-xl px-3 py-2 text-xs bg-white"
+                  />
+                  <input
+                    type="text"
+                    placeholder="Satuan (Pcs/Kg/Sak)"
+                    value={newProduct.unit}
+                    onChange={(e) => setNewProduct({ ...newProduct, unit: e.target.value })}
+                    className="border border-gray-200 rounded-xl px-3 py-2 text-xs bg-white"
+                  />
+                  <div className="flex space-x-2">
+                    <button type="submit" className="flex-1 bg-emerald-600 hover:bg-emerald-700 text-white font-bold rounded-xl text-xs py-2 shadow">
+                      {editingProduct ? 'Perbarui Produk' : 'Simpan Produk'}
+                    </button>
+                    {editingProduct && (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setEditingProduct(null);
+                          setNewProduct({ code: '', name: '', category: 'Sembako', buyPrice: '', sellPrice: '', stock: '', unit: 'Pcs', supplier: '' });
+                        }}
+                        className="bg-gray-200 hover:bg-gray-300 text-gray-700 font-bold rounded-xl text-xs px-3 py-2"
+                      >
+                        Batal
+                      </button>
+                    )}
+                  </div>
+                </form>
+              )}
 
               <div className="overflow-x-auto">
                 <table className="w-full text-left border-collapse">
@@ -1324,11 +1486,11 @@ export default function App() {
                       <th className="p-3">Kode / Barcode</th>
                       <th className="p-3">Nama Barang</th>
                       <th className="p-3">Kategori</th>
-                      <th className="p-3">Harga Beli</th>
+                      {currentUser?.role === 'Pemilik Warung' && <th className="p-3">Harga Beli</th>}
                       <th className="p-3">Harga Jual</th>
-                      <th className="p-3">Margin Laba</th>
+                      {currentUser?.role === 'Pemilik Warung' && <th className="p-3">Margin Laba</th>}
                       <th className="p-3">Stok</th>
-                      <th className="p-3 text-center">Aksi</th>
+                      {currentUser?.role === 'Pemilik Warung' && <th className="p-3 text-center">Aksi</th>}
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-gray-100 text-sm">
@@ -1340,50 +1502,56 @@ export default function App() {
                           <td className="p-3 font-mono text-xs text-gray-600">{p.code}</td>
                           <td className="p-3 font-semibold text-gray-800">{p.name}</td>
                           <td className="p-3"><span className="text-xs bg-emerald-50 text-emerald-700 px-2.5 py-1 rounded-md">{p.category}</span></td>
-                          <td className="p-3 text-gray-600">Rp {bPrice.toLocaleString()}</td>
+                          {currentUser?.role === 'Pemilik Warung' && (
+                            <td className="p-3 text-gray-600">Rp {bPrice.toLocaleString()}</td>
+                          )}
                           <td className="p-3 text-emerald-600 font-bold">Rp {sPrice.toLocaleString()}</td>
-                          <td className="p-3 text-blue-600 font-medium">Rp {(sPrice - bPrice).toLocaleString()}</td>
+                          {currentUser?.role === 'Pemilik Warung' && (
+                            <td className="p-3 text-blue-600 font-medium">Rp {(sPrice - bPrice).toLocaleString()}</td>
+                          )}
                           <td className="p-3">
                             <span className={`px-2.5 py-1 rounded-full text-xs font-bold ${p.stock <= 5 ? 'bg-red-100 text-red-700' : 'bg-emerald-100 text-emerald-800'}`}>
                               {p.stock} {p.unit}
                             </span>
                           </td>
-                          <td className="p-3 text-center">
-                            <div className="flex items-center justify-center space-x-1">
-                              <button
-                                onClick={() => {
-                                  setEditingProduct(p);
-                                  setNewProduct({
-                                    code: p.code,
-                                    name: p.name,
-                                    category: p.category,
-                                    buyPrice: p.buyPrice ?? p.buy_price ?? '',
-                                    sellPrice: p.sellPrice ?? p.sell_price ?? '',
-                                    stock: p.stock,
-                                    unit: p.unit || 'Pcs',
-                                    supplier: p.supplier || ''
-                                  });
-                                  window.scrollTo({ top: 0, behavior: 'smooth' });
-                                }}
-                                className="text-blue-500 hover:text-blue-700 p-1"
-                                title="Edit Produk"
-                              >
-                                <Edit className="w-4 h-4" />
-                              </button>
-                              <button
-                                onClick={async () => {
-                                  if (window.confirm(`Hapus produk "${p.name}" dari database?`)) {
-                                    await supabase.from('products').delete().eq('id', p.id);
-                                    fetchDataFromSupabase();
-                                  }
-                                }}
-                                className="text-red-500 hover:text-red-700 p-1"
-                                title="Hapus Produk"
-                              >
-                                <Trash2 className="w-4 h-4" />
-                              </button>
-                            </div>
-                          </td>
+                          {currentUser?.role === 'Pemilik Warung' && (
+                            <td className="p-3 text-center">
+                              <div className="flex items-center justify-center space-x-1">
+                                <button
+                                  onClick={() => {
+                                    setEditingProduct(p);
+                                    setNewProduct({
+                                      code: p.code,
+                                      name: p.name,
+                                      category: p.category,
+                                      buyPrice: p.buyPrice ?? p.buy_price ?? '',
+                                      sellPrice: p.sellPrice ?? p.sell_price ?? '',
+                                      stock: p.stock,
+                                      unit: p.unit || 'Pcs',
+                                      supplier: p.supplier || ''
+                                    });
+                                    window.scrollTo({ top: 0, behavior: 'smooth' });
+                                  }}
+                                  className="text-blue-500 hover:text-blue-700 p-1"
+                                  title="Edit Produk"
+                                >
+                                  <Edit className="w-4 h-4" />
+                                </button>
+                                <button
+                                  onClick={async () => {
+                                    if (window.confirm(`Hapus produk "${p.name}" dari database?`)) {
+                                      await supabase.from('products').delete().eq('id', p.id);
+                                      fetchDataFromSupabase();
+                                    }
+                                  }}
+                                  className="text-red-500 hover:text-red-700 p-1"
+                                  title="Hapus Produk"
+                                >
+                                  <Trash2 className="w-4 h-4" />
+                                </button>
+                              </div>
+                            </td>
+                          )}
                         </tr>
                       );
                     })}
@@ -1437,13 +1605,15 @@ export default function App() {
                           <span className="bg-amber-100 text-amber-800 text-xs font-bold px-3 py-1 rounded-full">
                             Rp {debt.amount.toLocaleString()}
                           </span>
-                          <button
-                            onClick={() => handleDeleteDebtCustomer(debt.id, debt.name)}
-                            title="Hapus data utang pelanggan ini"
-                            className="text-gray-400 hover:text-red-500 p-1 rounded-lg transition"
-                          >
-                            <Trash2 className="w-4 h-4" />
-                          </button>
+                          {currentUser?.role === 'Pemilik Warung' && (
+                            <button
+                              onClick={() => handleDeleteDebtCustomer(debt.id, debt.name)}
+                              title="Hapus data utang pelanggan ini"
+                              className="text-gray-400 hover:text-red-500 p-1 rounded-lg transition"
+                            >
+                              <Trash2 className="w-4 h-4" />
+                            </button>
+                          )}
                         </div>
                       </div>
 
@@ -1535,7 +1705,7 @@ export default function App() {
           )}
 
           {/* TAB 5: PEMBELIAN MASUK */}
-          {activeTab === 'purchases' && (
+          {activeTab === 'purchases' && currentUser?.role === 'Pemilik Warung' && (
             <div className="bg-white rounded-2xl shadow-sm border border-gray-100 p-6 space-y-6">
               <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
                 <div>
@@ -1635,7 +1805,7 @@ export default function App() {
           )}
 
           {/* TAB 7: LAPORAN KEUANGAN */}
-          {activeTab === 'reports' && (
+          {activeTab === 'reports' && currentUser?.role === 'Pemilik Warung' && (
             <div className="bg-white rounded-2xl shadow-sm border border-gray-100 p-6 space-y-6">
               <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
                 <div>
@@ -1788,7 +1958,7 @@ export default function App() {
           )}
 
           {/* TAB 8: PENGATURAN (Fitur 3: Tersimpan Permanen) */}
-          {activeTab === 'settings' && (
+          {activeTab === 'settings' && currentUser?.role === 'Pemilik Warung' && (
             <div className="bg-white rounded-2xl shadow-sm border border-gray-100 p-6 space-y-6 max-w-2xl">
               <div>
                 <h3 className="text-lg font-bold text-gray-800">Pengaturan Aplikasi Warung</h3>
