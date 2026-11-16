@@ -97,6 +97,7 @@ export default function App() {
     { id: 4, code: "BRD004", name: "Telur Ayam 1kg", category: "Sembako", buyPrice: 24000, sellPrice: 28000, stock: 8, unit: "Kg", supplier: "Peternakan Berkah" },
     { id: 5, code: "BRD005", name: "Mie Instan Goreng", category: "Makanan", buyPrice: 2800, sellPrice: 3500, stock: 120, unit: "Dus", supplier: "PT Indofood" },
     { id: 6, code: "BRD006", name: "Kopi Bubuk Hitam 165g", category: "Minuman", buyPrice: 8500, sellPrice: 10500, stock: 15, unit: "Pcs", supplier: "Agro Jaya" },
+    { id: 7, code: "BRD007", name: "Rokok Filter 12", category: "Rokok", buyPrice: 22000, sellPrice: 24500, stock: 20, unit: "Bungkus", supplier: "Agen Grosir Rokok" },
   ]);
   const [transactions, setTransactions] = useState([]);
   const [debts, setDebts] = useState([]);
@@ -1441,6 +1442,7 @@ export default function App() {
                     <option value="Sembako">Sembako</option>
                     <option value="Makanan">Makanan</option>
                     <option value="Minuman">Minuman</option>
+                    <option value="Rokok">Rokok</option>
                     <option value="Kebutuhan Rumah">Kebutuhan Rumah</option>
                   </select>
                   <input
