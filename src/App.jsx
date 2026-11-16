@@ -77,6 +77,18 @@ export default function App() {
     }
   };
 
+  // Format Nomor WhatsApp agar otomatis menggunakan kode negara internasional (62xxx)
+  const formatWhatsAppNumber = (phone) => {
+    if (!phone) return '';
+    let clean = String(phone).replace(/\D/g, '');
+    if (clean.startsWith('0')) {
+      clean = '62' + clean.slice(1);
+    } else if (clean.startsWith('8')) {
+      clean = '62' + clean;
+    }
+    return clean;
+  };
+
   // Data State
   const [products, setProducts] = useState([
     { id: 1, code: "BRD001", name: "Beras Premium 5kg", category: "Sembako", buyPrice: 60000, sellPrice: 68000, stock: 25, unit: "Sak", supplier: "Toko Tani Makmur" },
@@ -1687,15 +1699,29 @@ export default function App() {
                           <span>Cicil / Lunas</span>
                         </button>
 
-                        <a
-                          href={`https://wa.me/${debt.phone}?text=Halo%20${debt.name},%20ini%20dari%20${settings.name}.%20Mengingatkan%20sisa%20utang%20belanja%20sebesar%20Rp%20${debt.amount.toLocaleString()}.%20Terima%20kasih.`}
-                          target="_blank"
-                          rel="noreferrer"
-                          className="bg-emerald-100 text-emerald-800 hover:bg-emerald-200 py-2 rounded-xl text-xs font-bold flex items-center justify-center space-x-1"
-                        >
-                          <Phone className="w-3.5 h-3.5" />
-                          <span>WhatsApp</span>
-                        </a>
+                        {(() => {
+                          const waPhone = formatWhatsAppNumber(debt.phone);
+                          const waText = encodeURIComponent(
+                            `Halo Kak ${debt.name}, ini dari ${settings.name}.\n\nMengingatkan catatan sisa utang / kasbon belanja sebesar Rp ${debt.amount.toLocaleString()}.\n\nTerima kasih.`
+                          );
+                          return (
+                            <a
+                              href={waPhone ? `https://wa.me/${waPhone}?text=${waText}` : '#'}
+                              onClick={(e) => {
+                                if (!waPhone || waPhone.length < 9) {
+                                  e.preventDefault();
+                                  alert(`Nomor telepon untuk ${debt.name} (${debt.phone || 'kosong'}) belum valid untuk WhatsApp!`);
+                                }
+                              }}
+                              target="_blank"
+                              rel="noreferrer"
+                              className="bg-emerald-100 text-emerald-800 hover:bg-emerald-200 py-2 rounded-xl text-xs font-bold flex items-center justify-center space-x-1 transition"
+                            >
+                              <Phone className="w-3.5 h-3.5" />
+                              <span>WhatsApp</span>
+                            </a>
+                          );
+                        })()}
                       </div>
                     </div>
                   ))
